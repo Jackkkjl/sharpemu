@@ -48,15 +48,10 @@ public static class FiberExports
     [ThreadStatic]
     private static ulong _currentFiberAddress;
 
-    [ThreadStatic]
-    private static bool _fiberReturnRequested;
-
-    [ThreadStatic]
-    private static ulong _fiberReturnArgument;
-
+    private static readonly object _fiberGate = new();
     private static readonly ConcurrentDictionary<ulong, FiberContinuation> _continuations = new();
+    private static readonly ConcurrentDictionary<ulong, FiberReturnTarget> _returnTargets = new();
     private static readonly ConcurrentDictionary<ulong, FiberStackRange> _stackRanges = new();
-    private static readonly ConcurrentDictionary<ulong, FiberRunSession> _runSessions = new();
 
     [SysAbiExport(
         Nid = "hVYD7Ou2pCQ",
@@ -146,6 +141,7 @@ public static class FiberExports
         }
 
         _continuations.TryRemove(fiber, out _);
+        _returnTargets.TryRemove(fiber, out _);
         _stackRanges.TryRemove(fiber, out _);
         _ = TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateTerminated);
         return SetReturn(ctx, 0);
@@ -231,43 +227,75 @@ public static class FiberExports
     public static int FiberReturnToThread(CpuContext ctx)
     {
         var fiberAddress = ResolveCurrentFiberAddress(ctx);
-        var inferredFiber = false;
-        if (_currentFiberAddress == 0 && fiberAddress != 0)
-        {
-            inferredFiber = true;
-        }
-
         if (fiberAddress == 0)
         {
             return SetReturn(ctx, FiberErrorPermission);
         }
 
+        if (GuestThreadExecution.Scheduler is not { SupportsGuestContextTransfer: true } ||
+            !GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+        {
+            return SetReturn(ctx, FiberErrorPermission);
+        }
+
+        var returnArgument = ctx[CpuRegister.Rdi];
         var argOnRunAddress = ctx[CpuRegister.Rsi];
         if (argOnRunAddress != 0 && !TryWriteUInt64(ctx, argOnRunAddress, 0))
         {
             return SetReturn(ctx, FiberErrorInvalid);
         }
 
-        _fiberReturnRequested = true;
-        _fiberReturnArgument = ctx[CpuRegister.Rdi];
-        if (_runSessions.TryGetValue(fiberAddress, out var session))
-        {
-            session.SetReturn(ctx[CpuRegister.Rdi]);
-        }
-
-        if (GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+        GuestCpuContinuation transferTarget;
+        ulong previousFiber;
+        lock (_fiberGate)
         {
             _continuations[fiberAddress] = new FiberContinuation(
                 CaptureContinuation(ctx, frame.ReturnRip, frame.ResumeRsp, frame.ReturnSlotAddress),
                 argOnRunAddress);
-            TraceFiber($"yield{(inferredFiber ? "-inferred" : string.Empty)} fiber=0x{fiberAddress:X16} resume=0x{frame.ReturnRip:X16} rsp=0x{frame.ResumeRsp:X16} return_slot=0x{frame.ReturnSlotAddress:X16} arg_out=0x{argOnRunAddress:X16}");
-        }
-        else
-        {
-            TraceFiber($"yield-no-frame{(inferredFiber ? "-inferred" : string.Empty)} fiber=0x{fiberAddress:X16} arg_out=0x{argOnRunAddress:X16}");
+
+            if (!_returnTargets.TryRemove(fiberAddress, out var returnTarget))
+            {
+                _continuations.TryRemove(fiberAddress, out _);
+                return SetReturn(ctx, FiberErrorPermission);
+            }
+
+            previousFiber = returnTarget.PreviousFiber;
+            if (previousFiber != 0)
+            {
+                if (!_continuations.TryRemove(previousFiber, out var previousContinuation) ||
+                    !TryWriteResumeArgument(ctx, previousContinuation, returnArgument) ||
+                    !TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateRun))
+                {
+                    _continuations.TryRemove(fiberAddress, out _);
+                    return SetReturn(ctx, FiberErrorState);
+                }
+
+                transferTarget = previousContinuation.Context with { Rax = 0 };
+            }
+            else
+            {
+                if (!returnTarget.ThreadContinuation.HasValue ||
+                    !TryWriteResumeArgument(ctx, returnTarget.ThreadContinuation.Value, returnArgument))
+                {
+                    _continuations.TryRemove(fiberAddress, out _);
+                    return SetReturn(ctx, FiberErrorState);
+                }
+
+                transferTarget = returnTarget.ThreadContinuation.Value.Context with { Rax = 0 };
+            }
+
+            if (!TryWriteUInt32(ctx, fiberAddress + FiberStateOffset, FiberStateIdle))
+            {
+                return SetReturn(ctx, FiberErrorInvalid);
+            }
         }
 
-        GuestThreadExecution.RequestCurrentEntryExit("sceFiberReturnToThread", 0);
+        _currentFiberAddress = previousFiber;
+        _ = GuestThreadExecution.EnterFiber(previousFiber);
+        GuestThreadExecution.RequestCurrentContextTransfer(transferTarget);
+        TraceFiber(
+            $"return fiber=0x{fiberAddress:X16} to=0x{previousFiber:X16} " +
+            $"resume=0x{transferTarget.Rip:X16} rsp=0x{transferTarget.Rsp:X16} arg=0x{returnArgument:X16}");
         return SetReturn(ctx, 0);
     }
 
@@ -536,169 +564,151 @@ public static class FiberExports
             }
         }
 
-        if (fields.State != FiberStateIdle)
-        {
-            TraceFiber($"run-state-error reason={reason} fiber=0x{fiber:X16} state=0x{fields.State:X8}");
-            return SetReturn(ctx, FiberErrorState);
-        }
-
         var previousFiber = ResolveCurrentFiberAddress(ctx);
-        var switchingFromFiber = isSwitch && previousFiber != 0 && previousFiber != fiber;
-        if (isSwitch && previousFiber == 0)
+        if ((isSwitch && previousFiber == 0) ||
+            (!isSwitch && previousFiber != 0))
         {
             return SetReturn(ctx, FiberErrorPermission);
         }
-
-        var scheduler = GuestThreadExecution.Scheduler;
-        if (scheduler is null)
-        {
-            return SetReturn(ctx, FiberErrorPermission);
-        }
-
-        var session = new FiberRunSession();
-        var ownsSession = _runSessions.TryAdd(fiber, session);
-        if (!ownsSession && !_runSessions.TryGetValue(fiber, out session))
+        if (previousFiber == fiber)
         {
             return SetReturn(ctx, FiberErrorState);
         }
-
-        FiberContinuation? previousContinuation = null;
-        GuestImportCallFrame switchFrame = default;
-        if (switchingFromFiber)
+        if (GuestThreadExecution.Scheduler is not { SupportsGuestContextTransfer: true } ||
+            !GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
         {
-            if (!GuestThreadExecution.TryGetCurrentImportCallFrame(out switchFrame))
+            return SetReturn(ctx, FiberErrorPermission);
+        }
+
+        GuestCpuContinuation transferTarget;
+        var resumed = false;
+        lock (_fiberGate)
+        {
+            if (!TryReadFiberFields(ctx, fiber, out fields))
             {
-                if (ownsSession)
-                {
-                    _runSessions.TryRemove(fiber, out _);
-                }
-                TraceFiber($"switch-no-frame from=0x{previousFiber:X16} to=0x{fiber:X16} arg_out=0x{outArgumentAddress:X16}");
-                return SetReturn(ctx, FiberErrorPermission);
+                return SetReturn(ctx, FiberErrorInvalid);
+            }
+            if (fields.State != FiberStateIdle)
+            {
+                TraceFiber($"run-state-error reason={reason} fiber=0x{fiber:X16} state=0x{fields.State:X8}");
+                return SetReturn(ctx, FiberErrorState);
             }
 
-            previousContinuation = new FiberContinuation(
-                CaptureContinuation(ctx, switchFrame.ReturnRip, switchFrame.ResumeRsp, switchFrame.ReturnSlotAddress),
+            FiberContinuation targetContinuation;
+            if (_continuations.TryGetValue(fiber, out var savedContinuation))
+            {
+                targetContinuation = savedContinuation;
+                resumed = true;
+            }
+            else if (!TryCreateInitialContinuation(ctx, fields, argOnRun, out targetContinuation))
+            {
+                return SetReturn(ctx, FiberErrorInvalid);
+            }
+
+            if (resumed && !TryWriteResumeArgument(ctx, targetContinuation, argOnRun))
+            {
+                return SetReturn(ctx, FiberErrorInvalid);
+            }
+
+            var callerContinuation = new FiberContinuation(
+                CaptureContinuation(ctx, frame.ReturnRip, frame.ResumeRsp, frame.ReturnSlotAddress),
                 outArgumentAddress);
-        }
 
-        if (!TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateRun))
-        {
-            if (ownsSession)
+            if (previousFiber != 0)
             {
-                _runSessions.TryRemove(fiber, out _);
-            }
-            return SetReturn(ctx, FiberErrorInvalid);
-        }
-
-        if (switchingFromFiber && !TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateIdle))
-        {
-            _ = TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateIdle);
-            if (ownsSession)
-            {
-                _runSessions.TryRemove(fiber, out _);
-            }
-            return SetReturn(ctx, FiberErrorInvalid);
-        }
-
-        if (previousContinuation.HasValue)
-        {
-            _continuations[previousFiber] = previousContinuation.Value;
-            TraceFiber($"switch-save from=0x{previousFiber:X16} to=0x{fiber:X16} resume=0x{switchFrame.ReturnRip:X16} rsp=0x{switchFrame.ResumeRsp:X16} return_slot=0x{switchFrame.ReturnSlotAddress:X16} arg_out=0x{outArgumentAddress:X16}");
-        }
-
-        var previousReturnRequested = _fiberReturnRequested;
-        var previousReturnArgument = _fiberReturnArgument;
-        _currentFiberAddress = fiber;
-        _fiberReturnRequested = false;
-        _fiberReturnArgument = 0;
-        var previousExecutionFiber = GuestThreadExecution.EnterFiber(fiber);
-        TraceFiber($"run-enter reason={reason} fiber=0x{fiber:X16} prev=0x{previousFiber:X16} thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} managed={Environment.CurrentManagedThreadId} stack=0x{fields.ContextAddress:X16}");
-
-        var hasContinuation = _continuations.TryGetValue(fiber, out var continuation);
-        if (hasContinuation)
-        {
-            _continuations.TryRemove(fiber, out _);
-        }
-
-        TraceFiber(hasContinuation
-            ? $"run-dispatch reason={reason} fiber=0x{fiber:X16} resume=1 rip=0x{continuation.Context.Rip:X16} rsp=0x{continuation.Context.Rsp:X16} return_slot=0x{continuation.Context.ReturnSlotAddress:X16} arg_out=0x{continuation.ArgOnRunAddress:X16}"
-            : $"run-dispatch reason={reason} fiber=0x{fiber:X16} resume=0 rip=0x{fields.Entry:X16} rsp=0x{fields.ContextAddress + fields.ContextSize:X16} arg_out=0x{outArgumentAddress:X16}");
-        bool callbackOk;
-        string? callbackError;
-        try
-        {
-            if (hasContinuation)
-            {
-                if (continuation.ArgOnRunAddress != 0 &&
-                    !TryWriteUInt64(ctx, continuation.ArgOnRunAddress, argOnRun))
+                if (!TryReadUInt32(ctx, previousFiber + FiberStateOffset, out var previousState) ||
+                    previousState != FiberStateRun ||
+                    !TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateIdle))
                 {
-                    callbackOk = false;
-                    callbackError = $"failed to write resumed argOnRun to 0x{continuation.ArgOnRunAddress:X16}";
+                    return SetReturn(ctx, FiberErrorState);
                 }
-                else
-                {
-                    callbackOk = scheduler.TryCallGuestContinuation(
-                        ctx,
-                        continuation.Context,
-                        reason,
-                        out callbackError);
-                }
+
+                _continuations[previousFiber] = callerContinuation;
+                _returnTargets[fiber] = new FiberReturnTarget(previousFiber, null);
             }
             else
             {
-                callbackOk = scheduler.TryCallGuestFunction(
-                    ctx,
-                    fields.Entry,
-                    fields.ArgOnInitialize,
-                    argOnRun,
-                    fields.ContextAddress,
-                    fields.ContextSize,
-                    reason,
-                    out callbackError);
+                _returnTargets[fiber] = new FiberReturnTarget(0, callerContinuation);
             }
-        }
-        finally
-        {
-            GuestThreadExecution.RestoreFiber(previousExecutionFiber);
-        }
 
-        var returnRequested = _fiberReturnRequested;
-        var returnArgument = _fiberReturnArgument;
-        if (!returnRequested && session.TryGetReturn(out var sessionReturnArgument))
-        {
-            returnRequested = true;
-            returnArgument = sessionReturnArgument;
-        }
+            if (!TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateRun))
+            {
+                if (previousFiber != 0)
+                {
+                    _continuations.TryRemove(previousFiber, out _);
+                    _ = TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateRun);
+                }
+                _returnTargets.TryRemove(fiber, out _);
+                return SetReturn(ctx, FiberErrorInvalid);
+            }
 
-        if (ownsSession)
-        {
-            _runSessions.TryRemove(fiber, out _);
-        }
+            if (resumed)
+            {
+                _continuations.TryRemove(fiber, out _);
+            }
 
-        _currentFiberAddress = previousFiber;
-        _fiberReturnRequested = previousReturnRequested;
-        _fiberReturnArgument = previousReturnArgument;
-
-        _ = TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateIdle);
-        if (switchingFromFiber)
-        {
-            _ = TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateRun);
+            transferTarget = targetContinuation.Context with { Rax = 0 };
         }
 
-        if (!callbackOk)
-        {
-            TraceFiber($"run-failed fiber=0x{fiber:X16} entry=0x{fields.Entry:X16} error={callbackError}");
-            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP);
-        }
-
-        if (outArgumentAddress != 0 && !TryWriteUInt64(ctx, outArgumentAddress, returnArgument))
-        {
-            return SetReturn(ctx, FiberErrorInvalid);
-        }
-
-        TraceFiber($"run fiber=0x{fiber:X16} entry=0x{fields.Entry:X16} resume={hasContinuation} arg=0x{argOnRun:X16} ret=0x{returnArgument:X16}");
+        _currentFiberAddress = fiber;
+        _ = GuestThreadExecution.EnterFiber(fiber);
+        GuestThreadExecution.RequestCurrentContextTransfer(transferTarget);
+        TraceFiber(
+            $"transfer reason={reason} from=0x{previousFiber:X16} to=0x{fiber:X16} resume={resumed} " +
+            $"rip=0x{transferTarget.Rip:X16} rsp=0x{transferTarget.Rsp:X16} arg=0x{argOnRun:X16}");
         return SetReturn(ctx, 0);
     }
+
+    private static bool TryCreateInitialContinuation(
+        CpuContext ctx,
+        FiberFields fields,
+        ulong argOnRun,
+        out FiberContinuation continuation)
+    {
+        continuation = default;
+        if (fields.ContextAddress == 0 || fields.ContextSize < FiberContextMinimumSize)
+        {
+            return false;
+        }
+
+        var stackEnd = fields.ContextAddress + fields.ContextSize;
+        var entryRsp = (stackEnd & ~15UL) - sizeof(ulong);
+        if (!TryWriteUInt64(ctx, entryRsp, 0))
+        {
+            return false;
+        }
+
+        continuation = new FiberContinuation(
+            new GuestCpuContinuation(
+                fields.Entry,
+                entryRsp,
+                entryRsp,
+                ctx.Rflags == 0 ? 0x202UL : ctx.Rflags,
+                ctx.FsBase,
+                ctx.GsBase,
+                0,
+                0,
+                0,
+                0,
+                0,
+                argOnRun,
+                fields.ArgOnInitialize,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0),
+            0);
+        return true;
+    }
+
+    private static bool TryWriteResumeArgument(
+        CpuContext ctx,
+        FiberContinuation continuation,
+        ulong argument) =>
+        continuation.ArgOnRunAddress == 0 ||
+        TryWriteUInt64(ctx, continuation.ArgOnRunAddress, argument);
 
     private static GuestCpuContinuation CaptureContinuation(
         CpuContext ctx,
@@ -1007,30 +1017,9 @@ public static class FiberExports
         GuestCpuContinuation Context,
         ulong ArgOnRunAddress);
 
-    private sealed class FiberRunSession
-    {
-        private int _returnRequested;
-
-        private ulong _returnArgument;
-
-        public void SetReturn(ulong argument)
-        {
-            _returnArgument = argument;
-            Volatile.Write(ref _returnRequested, 1);
-        }
-
-        public bool TryGetReturn(out ulong argument)
-        {
-            if (Volatile.Read(ref _returnRequested) == 0)
-            {
-                argument = 0;
-                return false;
-            }
-
-            argument = _returnArgument;
-            return true;
-        }
-    }
+    private readonly record struct FiberReturnTarget(
+        ulong PreviousFiber,
+        FiberContinuation? ThreadContinuation);
 
     private readonly record struct FiberStackRange(ulong Start, ulong Size)
     {

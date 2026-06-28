@@ -30,6 +30,7 @@ public static class AgcExports
     private const uint RUcRegsIndirect = 0x13;
     private const uint RAcquireMem = 0x14;
     private const uint RFlip = 0x17;
+    private const uint RReleaseMem = 0x18;
     private const uint SpiShaderPgmLoPs = 0x8;
     private const uint SpiShaderPgmHiPs = 0x9;
     private const uint SpiShaderPgmLoEs = 0xC8;
@@ -47,8 +48,11 @@ public static class AgcExports
     private const uint Gen5TextureType2D = 9;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
+    private const ulong VideoOutPixelFormatB8G8R8A8Unorm = 0x8100000000000000;
+    private const ulong VideoOutPixelFormatR8G8B8A8Unorm = 0x8100000022000000;
     private const uint RegisterDefaultsVersion7 = 7;
     private const uint RegisterDefaultsVersion8 = 8;
+    private const uint RegisterDefaultsVersion10 = 10;
     private const int RegisterDefaultsSize = 0x40;
     private const int RegisterDefaultBlockSize = 16 * 8;
 
@@ -498,6 +502,64 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "wr23dPKyWc0",
+        ExportName = "sceAgcCbReleaseMem",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int CbReleaseMem(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var action = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
+        var gcrControl = (uint)(ctx[CpuRegister.Rdx] & 0xFFFF);
+        var destination = (uint)(ctx[CpuRegister.Rcx] & 0xFF);
+        var cachePolicy = (uint)(ctx[CpuRegister.R8] & 0xFF);
+        var destinationAddress = ctx[CpuRegister.R9];
+        var stackAddress = ctx[CpuRegister.Rsp];
+        if (!TryReadUInt64(ctx, stackAddress + 8, out var dataSelectionRaw) ||
+            !TryReadUInt64(ctx, stackAddress + 16, out var data) ||
+            !TryReadUInt64(ctx, stackAddress + 24, out var gdsOffsetRaw) ||
+            !TryReadUInt64(ctx, stackAddress + 32, out var gdsSizeRaw) ||
+            !TryReadUInt64(ctx, stackAddress + 40, out var interruptRaw) ||
+            !TryReadUInt64(ctx, stackAddress + 48, out var interruptContextIdRaw))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var dataSelection = (uint)(dataSelectionRaw & 0xFF);
+        var gdsOffset = (uint)(gdsOffsetRaw & 0xFFFF);
+        var gdsSize = (uint)(gdsSizeRaw & 0xFFFF);
+        var interrupt = (uint)(interruptRaw & 0xFF);
+        var interruptContextId = (uint)interruptContextIdRaw;
+        if (commandBufferAddress == 0 ||
+            destination != 1 ||
+            dataSelection is not (2 or 3) ||
+            gdsOffset != 0 ||
+            gdsSize != 1 ||
+            interrupt != 0 ||
+            interruptContextId != 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 7, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(7, ItNop, RReleaseMem)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, action | (cachePolicy << 8)) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, gcrControl | (dataSelection << 16)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)destinationAddress) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)(destinationAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, (uint)data) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, (uint)(data >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.cb_release_mem buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
+            $"action=0x{action:X2} gcr=0x{gcrControl:X4} dst=0x{destinationAddress:X16} data_sel={dataSelection} data=0x{data:X16}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
         Nid = "TRO721eVt4g",
         ExportName = "sceAgcDcbResetQueue",
         Target = Generation.Gen5,
@@ -826,6 +888,50 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "w2rJhmD+dsE",
+        ExportName = "sceAgcDriverAddEqEvent",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverAddEqEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var eventId = ctx[CpuRegister.Rsi];
+        var userData = ctx[CpuRegister.Rdx];
+        if (!KernelEventQueueCompatExports.RegisterEvent(
+                equeue,
+                eventId,
+                KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                userData))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+        }
+
+        TraceAgc($"agc.driver_add_eq_event eq=0x{equeue:X16} id=0x{eventId:X16} udata=0x{userData:X16}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "DL2RXaXOy88",
+        ExportName = "sceAgcDriverDeleteEqEvent",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverDeleteEqEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var eventId = ctx[CpuRegister.Rsi];
+        if (!KernelEventQueueCompatExports.DeleteRegisteredEvent(
+                equeue,
+                eventId,
+                KernelEventQueueCompatExports.KernelEventFilterGraphics))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+        }
+
+        TraceAgc($"agc.driver_delete_eq_event eq=0x{equeue:X16} id=0x{eventId:X16}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
         Nid = "UglJIZjGssM",
         ExportName = "sceAgcDriverSubmitDcb",
         Target = Generation.Gen5,
@@ -871,6 +977,20 @@ public static class AgcExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(
+        Nid = "qj7QZpgr9Uw",
+        ExportName = "sceAgcUnknownQj7QZpgr9Uw",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UnknownQj7QZpgr9Uw(CpuContext ctx)
+    {
+        TraceAgc(
+            $"agc.unknown_qj7 rdi=0x{ctx[CpuRegister.Rdi]:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+            $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static void ParseSubmittedDcb(CpuContext ctx, ulong commandAddress, uint dwordCount, bool tracePackets)
     {
         if (commandAddress == 0 || dwordCount == 0 || dwordCount > 1_000_000)
@@ -911,6 +1031,26 @@ public static class AgcExports
             }
 
             ApplySubmittedRegisters(ctx, state, currentAddress, length, op, register);
+
+            if (op == ItEventWrite &&
+                length >= 2 &&
+                TryReadUInt32(ctx, currentAddress + sizeof(uint), out var eventTypeRaw))
+            {
+                var eventType = eventTypeRaw & 0x3Fu;
+                var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
+                    eventType,
+                    KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                    eventType);
+                if (tracePackets)
+                {
+                    TraceAgc($"agc.dcb.event type=0x{eventType:X2} queues={triggered}");
+                }
+            }
+
+            if (op == ItNop && register == RReleaseMem && length >= 7)
+            {
+                ApplySubmittedReleaseMem(ctx, currentAddress, tracePackets);
+            }
 
             if (op == ItDrawIndexOffset2 &&
                 length >= 5 &&
@@ -969,6 +1109,38 @@ public static class AgcExports
             }
 
             offset += length;
+        }
+    }
+
+    private static void ApplySubmittedReleaseMem(
+        CpuContext ctx,
+        ulong packetAddress,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 8, out var control) ||
+            !TryReadUInt32(ctx, packetAddress + 12, out var destinationLo) ||
+            !TryReadUInt32(ctx, packetAddress + 16, out var destinationHi) ||
+            !TryReadUInt32(ctx, packetAddress + 20, out var dataLo) ||
+            !TryReadUInt32(ctx, packetAddress + 24, out var dataHi))
+        {
+            return;
+        }
+
+        var dataSelection = (control >> 16) & 0xFFu;
+        var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
+        var data = ((ulong)dataHi << 32) | dataLo;
+        var wroteData = dataSelection switch
+        {
+            2 => TryWriteUInt32(ctx, destinationAddress, dataLo),
+            3 => ctx.TryWriteUInt64(destinationAddress, data),
+            _ => false,
+        };
+
+        if (tracePacket)
+        {
+            TraceAgc(
+                $"agc.dcb.release_mem dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
+                $"data=0x{data:X16} wrote={wroteData}");
         }
     }
 
@@ -1152,7 +1324,11 @@ public static class AgcExports
             destination.Width > 8192 ||
             destination.Height > 8192 ||
             destination.TilingMode != 0 ||
-            destination.PixelFormat is not (VideoOutPixelFormatA8R8G8B8Srgb or VideoOutPixelFormatA8B8G8R8Srgb))
+            destination.PixelFormat is not (
+                VideoOutPixelFormatA8R8G8B8Srgb or
+                VideoOutPixelFormatA8B8G8R8Srgb or
+                VideoOutPixelFormatB8G8R8A8Unorm or
+                VideoOutPixelFormatR8G8B8A8Unorm))
         {
             return false;
         }
@@ -1189,7 +1365,9 @@ public static class AgcExports
         }
 
         var destinationRow = new byte[checked((int)destinationPitch * 4)];
-        var rgbaDestination = destination.PixelFormat == VideoOutPixelFormatA8B8G8R8Srgb;
+        var rgbaDestination = destination.PixelFormat is
+            VideoOutPixelFormatA8B8G8R8Srgb or
+            VideoOutPixelFormatR8G8B8A8Unorm;
         for (uint y = 0; y < destination.Height; y++)
         {
             var sourceY = (uint)(((ulong)y * source.Height) / destination.Height);
@@ -1493,7 +1671,10 @@ public static class AgcExports
 
     private static bool IsSupportedRegisterDefaultsVersion(uint version)
     {
-        return version is RegisterDefaultsVersion7 or RegisterDefaultsVersion8;
+        return version is
+            RegisterDefaultsVersion7 or
+            RegisterDefaultsVersion8 or
+            RegisterDefaultsVersion10;
     }
 
     private static bool TryGetRegisterDefaultsAllocation(
@@ -1696,7 +1877,9 @@ public static class AgcExports
 
     private static void TraceCreateShader(ulong destinationAddress, ulong headerAddress, ulong codeAddress, string detail)
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal))
+        var isOk = string.Equals(detail, "ok", StringComparison.Ordinal);
+        if (isOk &&
+            !string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal))
         {
             return;
         }
